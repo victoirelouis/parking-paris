@@ -3,7 +3,7 @@ import folium
 from streamlit_folium import st_folium
 import pandas as pd
 from datetime import datetime, timedelta
-from main import SystemeParkingParis
+from main import AssistantNavigation, PredicteurSaturation, CollecteurDonnees
 import os
 from dotenv import load_dotenv
 from geopy.geocoders import Nominatim
@@ -25,8 +25,10 @@ st.markdown("Trouvez la meilleure place de parking avec prédiction de la satura
 # Initialiser le système
 @st.cache_resource
 def init_system():
-    load_dotenv() 
-    return SystemeParkingParis()
+    load_dotenv()
+    collecteur = CollecteurDonnees()
+    predicteur = PredicteurSaturation(collecteur)
+    return AssistantNavigation(predicteur, collecteur)
 
 # Initialiser le géocodeur
 @st.cache_resource
@@ -89,6 +91,28 @@ with st.expander("⚙️ Options avancées"):
         )
         rayon_metro = st.slider("🔍 Rayon de recherche métro (km)", 0.3, 1.5, 0.8, 0.1, 
                                help="Distance maximale pour chercher les stations de métro")
+        
+
+# Nouvelle section pour véhicules électriques
+with st.expander("🔋 Options véhicule électrique"):
+    col_elec1, col_elec2 = st.columns(2)
+    with col_elec1:
+        vehicule_electrique = st.checkbox("🚗⚡ Véhicule électrique", value=False, 
+                                        help="Afficher les bornes de recharge Belib")
+        if vehicule_electrique:
+            type_vehicule = st.selectbox(
+                "Type de véhicule",
+                ["voiture", "utilitaire", "moto"],
+                help="Détermine les types de connecteurs compatibles"
+            )
+    with col_elec2:
+        if vehicule_electrique:
+            afficher_bornes = st.checkbox("👁️ Afficher les bornes sur la carte", value=True)
+            rayon_bornes = st.slider("🔍 Rayon recherche bornes (km)", 0.5, 3.0, 2.0, 0.5)
+        else:
+            afficher_bornes = False
+            rayon_bornes = 2.0
+            type_vehicule = "voiture"
 
 # Exemples d'adresses
 with st.expander("💡 Exemples d'adresses"):
@@ -144,7 +168,14 @@ if rechercher and adresse_depart and adresse_destination:
             
             # Recherche de parking
             with st.spinner("🔍 Recherche des meilleurs parkings, analyse des travaux et vérification du métro..."):
-                resultat = systeme.assister_conducteur(coords_depart, coords_destination)
+                if vehicule_electrique:
+                    resultat = systeme.recommander_avec_bornes_electriques(
+                        coords_depart, coords_destination, datetime.now(),
+                        type_vehicule=type_vehicule, inclure_bornes=True
+                        )
+                else:
+                    resultat = systeme.assister_conducteur(coords_depart, coords_destination)
+
             
             # Affichage des résultats
             st.markdown("## 📊 Parking Recommandé")
@@ -232,7 +263,22 @@ if rechercher and adresse_depart and adresse_destination:
                             delta=delta_text,
                             delta_color=delta_color
                         )
-                
+                # Métriques bornes électriques si applicable
+                if vehicule_electrique and resultat.get('bornes_electriques'):
+                    bornes_info = resultat['bornes_electriques']
+                    st.markdown("### 🔋 Bornes électriques proches")
+                    
+                    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+                    with col_b1:
+                        st.metric("Total bornes", bornes_info['total_trouvees'])
+                    with col_b2:
+                        st.metric("Compatibles", bornes_info['compatibles'])
+                    with col_b3:
+                        st.metric("Disponibles", bornes_info['disponibles'])
+                    with col_b4:
+                        vehicule_emoji = {"voiture": "🚗", "utilitaire": "🚐", "moto": "🏍️"}.get(type_vehicule, "🚗")
+                        st.metric("Type véhicule", f"{vehicule_emoji} {type_vehicule.title()}")
+
                 # Informations détaillées
                 st.markdown("### 📋 Détails")
                 
@@ -283,10 +329,8 @@ if rechercher and adresse_depart and adresse_destination:
                 
                 # Carte interactive avec travaux et métro
                 st.markdown("### 🗺️ Carte Interactive")
-                
                 parking_lat = resultat['parking_recommande']['latitude']
                 parking_lon = resultat['parking_recommande']['longitude']
-                
                 if parking_lat is not None and parking_lon is not None:
                     # Créer la carte
                     m = folium.Map(
@@ -318,6 +362,57 @@ if rechercher and adresse_depart and adresse_destination:
                         tooltip="Parking recommandé",
                         icon=folium.Icon(color='green', icon='car', prefix='fa')
                     ).add_to(m)
+
+                    # Ajouter les bornes électriques à la carte
+                if vehicule_electrique and afficher_bornes and resultat.get('bornes_electriques'):
+                    bornes_recommandees = resultat['bornes_electriques']['recommandees']
+                    
+                    for i, borne_data in enumerate(bornes_recommandees):
+                        borne = borne_data['borne']
+                        
+                        # Couleur selon statut et disponibilité
+                        if not borne.compatible_vehicule:
+                            icon_color = 'gray'
+                            icon_symbol = 'times'
+                        elif not borne.disponible or borne.statut != "En service":
+                            icon_color = 'red'
+                            icon_symbol = 'bolt'
+                        elif borne.nb_places_libres == 0:
+                            icon_color = 'orange'
+                            icon_symbol = 'bolt'
+                        else:
+                            icon_color = 'lightgreen'
+                            icon_symbol = 'bolt'
+                        
+                        # Popup détaillé
+                        connecteurs_str = ", ".join(borne.types_connecteurs)
+                        popup_html = f"""
+                        <div style='width: 250px;'>
+                            <h4 style='color: #27ae60;'>🔋 {borne.nom}</h4>
+                            <p><b>📍 Adresse:</b> {borne.adresse}</p>
+                            <p><b>⚡ Puissance:</b> {borne.puissance_max}</p>
+                            <p><b>🔌 Connecteurs:</b> {connecteurs_str}</p>
+                            <p><b>📊 Points de charge:</b> {borne.nb_points_charge}</p>
+                            <p><b>🟢 Libres:</b> {borne.nb_places_libres}/{borne.nb_points_charge}</p>
+                            <p><b>🏢 Opérateur:</b> {borne.operateur}</p>
+                            <p><b>💰 Tarif:</b> {borne.tarif_info}</p>
+                            <p><b>🚶 Marche destination:</b> {borne_data['temps_marche_destination']} min</p>
+                            <p><b>📏 Distance:</b> {borne.distance_point:.2f} km</p>
+                            <p><b>✅ Compatible:</b> {'Oui' if borne.compatible_vehicule else 'Non'}</p>
+                            <p><b>📋 Statut:</b> {borne.statut}</p>
+                        </div>
+                        """
+                        
+                        # Rang dans les recommandations
+                        rank_text = f"#{i+1}" if i < 3 else ""
+                        
+                        folium.Marker(
+                            [borne.latitude, borne.longitude],
+                            popup=folium.Popup(popup_html, max_width=300),
+                            tooltip=f"🔋 {borne.nom} {rank_text}",
+                            icon=folium.Icon(color=icon_color, icon=icon_symbol, prefix='fa')
+                        ).add_to(m)
+
                     
                     # Afficher les travaux sur la carte
                     if afficher_travaux and resultat.get('travaux_tous'):
@@ -426,6 +521,78 @@ if rechercher and adresse_depart and adresse_destination:
                                     icon=folium.Icon(color=icon_color, icon=icon_symbol, prefix='fa')
                                 ).add_to(m)
                     
+                # Section détaillée des bornes électriques
+                        if vehicule_electrique and resultat.get('bornes_electriques'):
+                            st.markdown("### 🔋 Bornes électriques recommandées")
+                            
+                            bornes_info = resultat['bornes_electriques']
+                            
+                            # Alertes bornes
+                            if bornes_info['compatibles'] == 0:
+                                st.error("❌ Aucune borne compatible trouvée pour votre type de véhicule")
+                            elif bornes_info['disponibles'] == 0:
+                                st.warning("⚠️ Aucune borne disponible actuellement")
+                            elif bornes_info['disponibles'] < 3:
+                                st.info(f"ℹ️ Seulement {bornes_info['disponibles']} borne(s) disponible(s)")
+                            
+                            # Tableau des bornes recommandées
+                            if bornes_info['recommandees']:
+                                bornes_data = []
+                                for i, borne_data in enumerate(bornes_info['recommandees']):
+                                    borne = borne_data['borne']
+                                    
+                                    # Emojis de statut
+                                    statut_emoji = "🟢" if borne.disponible and borne.statut == "En service" else "🔴"
+                                    compat_emoji = "✅" if borne.compatible_vehicule else "❌"
+                                    
+                                    # Type de charge
+                                    if "50 kW" in borne.puissance_max or "DC" in borne.puissance_max:
+                                        charge_type = "🚀 Rapide"
+                                    elif "22 kW" in borne.puissance_max:
+                                        charge_type = "⚡ Standard"
+                                    else:
+                                        charge_type = "🐌 Lente"
+                                    
+                                    bornes_data.append({
+                                        "Rang": f"#{i+1}",
+                                        "Borne": borne.nom,
+                                        "📍 Distance": f"{borne.distance_point:.2f} km",
+                                        "⚡ Puissance": f"{charge_type} {borne.puissance_max}",
+                                        "🔌 Connecteurs": ", ".join(borne.types_connecteurs[:2]),  # Limiter l'affichage
+                                        f"📊 Libres": f"{borne.nb_places_libres}/{borne.nb_points_charge}",
+                                        "🚶 Marche": f"{borne_data['temps_marche_destination']} min",
+                                        "✅ Compatible": compat_emoji,
+                                        "📋 Statut": f"{statut_emoji} {borne.statut}",
+                                        "💰 Tarif": borne.tarif_info
+                                    })
+                                
+                                df_bornes = pd.DataFrame(bornes_data)
+                                st.dataframe(df_bornes, use_container_width=True, hide_index=True)
+                                
+                                # Conseils d'utilisation
+                                st.markdown("#### 💡 Conseils")
+                                conseils = []
+                                
+                                # Analyser les bornes pour donner des conseils
+                                bornes_rapides = [b for b in bornes_info['recommandees'] if "50 kW" in b['borne'].puissance_max]
+                                bornes_proches = [b for b in bornes_info['recommandees'] if b['distance_destination'] < 0.5]
+                                
+                                if bornes_rapides:
+                                    conseils.append("🚀 Des bornes de charge rapide sont disponibles pour un rechargement express")
+                                
+                                if bornes_proches:
+                                    conseils.append("🎯 Des bornes sont très proches de votre destination (< 500m)")
+                                
+                                if any(b['borne'].acces != "Public" for b in bornes_info['recommandees']):
+                                    conseils.append("⚠️ Certaines bornes peuvent avoir un accès restreint - vérifiez avant de vous déplacer")
+                                
+                                connecteurs_vehicule = {"voiture": "Type 2 ou Combo CCS", "utilitaire": "Type 2", "moto": "Type EF ou Type 2"}
+                                conseil_connecteur = connecteurs_vehicule.get(type_vehicule, "Type 2")
+                                conseils.append(f"🔌 Votre {type_vehicule} est généralement compatible avec: {conseil_connecteur}")
+                                
+                                for conseil in conseils:
+                                    st.info(conseil)
+
                     # Tracer les trajets
                     if resultat.get('route_to_parking_points') and len(resultat['route_to_parking_points']) > 1:
                         # Trajet vers parking avec style adapté aux travaux
@@ -512,9 +679,10 @@ if rechercher and adresse_depart and adresse_destination:
                         
                         metro_col = "➖ Normal"
                         if alt.get('impact_metro'):
-                            if "avantageux" in alt['impact_metro'].get('recommandation', '').lower():
+                            recommandation = str(alt['impact_metro'].get('recommandation', '') or '').lower()
+                            if "avantageux" in recommandation:
                                 metro_col = "✅ Avantageux"
-                            elif "attention" in alt['impact_metro'].get('recommandation', '').lower():
+                            elif "attention" in recommandation:
                                 metro_col = "⚠️ Attention"
                         
                         alternatives_data.append({
@@ -551,9 +719,29 @@ if rechercher and adresse_depart and adresse_destination:
                     if resultat.get('impact_metro'):
                         stations_fermees_total = len(resultat['impact_metro'].get('stations_fermees_destination', [])) + len(resultat['impact_metro'].get('stations_fermees_parking', []))
                     st.metric("Stations fermées proches", stations_fermees_total)
-                
-            else:
-                st.info("Aucune recommandation de parking n'a pu être générée pour les adresses spécifiées. Veuillez réessayer.")
+
+                if vehicule_electrique and resultat.get('bornes_electriques'):
+                    # Ligne supplémentaire pour les bornes
+                    summary_col5, summary_col6, summary_col7, summary_col8 = st.columns(4)
+                    
+                    with summary_col5:
+                        st.metric("Bornes trouvées", bornes_info['total_trouvees'])
+                    
+                    with summary_col6:
+                        st.metric("Bornes compatibles", bornes_info['compatibles'])
+                    
+                    with summary_col7:
+                        st.metric("Bornes disponibles", bornes_info['disponibles'])
+                    
+                    with summary_col8:
+                        if bornes_info['recommandees']:
+                            plus_proche = min(bornes_info['recommandees'], key=lambda x: x['distance_destination'])
+                            st.metric("Plus proche", f"{plus_proche['distance_destination']:.1f} km")
+                        else:
+                            st.metric("Plus proche", "N/A")
+                                
+                else:
+                    st.info("Aucune recommandation de parking n'a pu être générée pour les adresses spécifiées. Veuillez réessayer.")
 
         else:
             st.error("""
@@ -614,6 +802,18 @@ with st.sidebar:
     - **🚇 Rouge** = Station fermée
     - **🟢 Avantageux** = Station fermée = plus de demande parking
     - **⚠️ Attention** = Station fermée près parking
+                
+    ### 🔋 Véhicules électriques
+    
+    **Types de véhicules supportés:**
+    - **🚗 Voiture** = Type 2, Combo CCS, CHAdeMO
+    - **🚐 Utilitaire** = Type 2, Combo CCS  
+    - **🏍️ Moto** = Type 2, Type EF
+    
+    **Légende des bornes:**
+    - **🔋 Vert clair** = Disponible et compatible
+    - **🔋 Orange** = Occupé mais compatible
+    - **🔋 Rouge** = Hors service
     
     ### 💡 Astuces
     

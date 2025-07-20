@@ -12,6 +12,10 @@ import hashlib
 import hmac
 import base64
 import re
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import requests
+import json
 
 # Pour charger les variables d'environnement depuis .env
 from dotenv import load_dotenv
@@ -44,6 +48,41 @@ RATP_TRAFFIC_ENDPOINT = f"{RATP_API_BASE}/traffic"
 
 # Récupère la clé API Google Maps
 Maps_API_KEY = os.getenv("Maps_API_KEY")
+
+@dataclass
+class BorneElectrique:
+    """Structure de données pour une borne électrique Belib"""
+    id: str
+    nom: str
+    adresse: str
+    latitude: float
+    longitude: float
+    statut: str  # "En service", "Hors service", "En maintenance"
+    nb_points_charge: int
+    types_connecteurs: List[str]  # ["Type 2", "CHAdeMO", "Combo CCS"]
+    puissance_max: str  # "22 kW", "50 kW", etc.
+    disponible: bool
+    nb_places_libres: int
+    acces: str  # "Public", "Réservé aux résidents", etc.
+    operateur: str
+    tarif_info: str
+    distance_point: float = 0.0  # Distance au point de référence
+    compatible_vehicule: bool = True  # Sera calculé selon le type de véhicule
+
+
+
+def _verifier_compatibilite_vehicule(self, type_vehicule: str, connecteurs: list, puissance: str) -> bool:
+        """Vérifie la compatibilité entre le véhicule et la borne"""
+        compatibilites = {
+            "voiture": ["Type 2", "Combo CCS", "CHAdeMO"],  # La plupart des voitures électriques
+            "utilitaire": ["Type 2", "Combo CCS"],  # Véhicules utilitaires
+            "moto": ["Type 2", "Type EF"],  # Motos et scooters électriques
+            "velo": ["Type EF"],  # Vélos électriques (rare)
+        }
+        vehicule_connecteurs = compatibilites.get(type_vehicule.lower(), ["Type 2"])
+        # Vérifier si au moins un connecteur est compatible
+        return any(conn in connecteurs for conn in vehicule_connecteurs)
+
 
 @dataclass
 class Parking:
@@ -106,6 +145,9 @@ class PredictionSaturation:
     temps_avant_saturation: Optional[str]
 
 class CollecteurMeteoInfoclimat:
+
+
+
     def __init__(self):
         self.infoclimat_username = os.getenv("INFOCLIMAT_USERNAME")
         self.infoclimat_private_key = os.getenv("INFOCLIMAT_PRIVATE_KEY")
@@ -191,7 +233,238 @@ class CollecteurMeteoInfoclimat:
 
 
 class CollecteurDonnees:
+    # Constantes pour l'API Belib
+    BELIB_API_URL = "https://opendata.paris.fr/api/records/1.0/search/"
+    BELIB_DATASET = "belib-points-de-recharge-pour-vehicules-electriques-donnees-statiques"
+    BELIB_TEMPS_REEL_DATASET = "belib-disponibilite-temps-reel"
+
+    def _generer_bornes_fallback(self, destination: Tuple[float, float] = None) -> List[BorneElectrique]:
+        """Génère des bornes électriques simulées pour les tests"""
+        bornes_simulees = [
+            {
+                'id': 'BELIB_001',
+                'nom': 'Belib - Hôtel de Ville',
+                'adresse': 'Place de l\'Hôtel de Ville, 75004 Paris',
+                'latitude': 48.8566, 'longitude': 2.3522,
+                'statut': 'En service', 'nb_points_charge': 4,
+                'types_connecteurs': ['Type 2', 'Combo CCS'],
+                'puissance_max': '22 kW', 'disponible': True,
+                'nb_places_libres': 2, 'acces': 'Public',
+                'operateur': 'Belib', 'tarif_info': '0.25€/kWh'
+            },
+            {
+                'id': 'BELIB_002',
+                'nom': 'Belib - République',
+                'adresse': 'Place de la République, 75011 Paris',
+                'latitude': 48.8675, 'longitude': 2.3636,
+                'statut': 'En service', 'nb_points_charge': 6,
+                'types_connecteurs': ['Type 2', 'CHAdeMO'],
+                'puissance_max': '50 kW', 'disponible': True,
+                'nb_places_libres': 4, 'acces': 'Public',
+                'operateur': 'Belib', 'tarif_info': '0.35€/kWh'
+            },
+            {
+                'id': 'BELIB_003',
+                'nom': 'Belib - Bastille',
+                'adresse': 'Place de la Bastille, 75012 Paris',
+                'latitude': 48.8532, 'longitude': 2.3692,
+                'statut': 'En maintenance', 'nb_points_charge': 2,
+                'types_connecteurs': ['Type 2'],
+                'puissance_max': '7 kW', 'disponible': False,
+                'nb_places_libres': 0, 'acces': 'Public',
+                'operateur': 'Belib', 'tarif_info': '0.25€/kWh'
+            }
+        ]
+        
+        bornes = []
+        for b in bornes_simulees:
+            borne = BorneElectrique(
+                id=b['id'], nom=b['nom'], adresse=b['adresse'],
+                latitude=b['latitude'], longitude=b['longitude'],
+                statut=b['statut'], nb_points_charge=b['nb_points_charge'],
+                types_connecteurs=b['types_connecteurs'],
+                puissance_max=b['puissance_max'], disponible=b['disponible'],
+                nb_places_libres=b['nb_places_libres'], acces=b['acces'],
+                operateur=b['operateur'], tarif_info=b['tarif_info'],
+                compatible_vehicule=True
+            )
+            
+            if destination:
+                borne.distance_point = self._calculer_distance(
+                    b['latitude'], b['longitude'], destination[0], destination[1]
+                )
+            
+            bornes.append(borne)
+        
+        print(f"✅ {len(bornes)} bornes électriques simulées générées")
+        return bornes
+
     """Collecte et agrège les données de différentes sources"""
+    # AJOUT DANS la classe CollecteurDonnees
+
+    # URLs API Belib
+    BELIB_API_URL = "https://opendata.paris.fr/api/records/1.0/search/"
+    BELIB_DATASET = "belib-points-de-recharge-pour-vehicules-electriques-donnees-statiques"
+    BELIB_TEMPS_REEL_DATASET = "belib-disponibilite-temps-reel"
+
+    def recuperer_bornes_belib(self, destination: Tuple[float, float] = None, 
+                            rayon_max_km: float = 2.0,
+                            type_vehicule: str = "voiture") -> List[BorneElectrique]:
+        """Récupère les bornes électriques Belib en temps réel"""
+        bornes = []
+        
+        try:
+            print("🔋 Récupération des bornes électriques Belib...")
+            
+            # 1. Récupérer les données statiques des bornes
+            params_statiques = {
+                "dataset": self.BELIB_DATASET,
+                "rows": 100,  # Limiter pour éviter la surcharge
+                "facet": "statut",
+                "refine.statut": "En fonctionnement"
+            }
+            
+            # Filtrer par zone géographique si destination fournie
+            if destination:
+                lat, lon = destination
+                # Définir une bbox autour de la destination
+                bbox_margin = 0.02  # ~2.2km
+                bbox = f"{lat-bbox_margin},{lon-bbox_margin},{lat+bbox_margin},{lon+bbox_margin}" 
+                           
+            response_statiques = requests.get(self.BELIB_API_URL, params=params_statiques, timeout=10)
+            response_statiques.raise_for_status()
+            data_statiques = response_statiques.json()
+            
+            # 2. Récupérer les données temps réel
+            params_temps_reel = {
+                "dataset": self.BELIB_TEMPS_REEL_DATASET,
+                "rows": 100
+            }
+            
+            try:
+                response_temps_reel = requests.get(self.BELIB_API_URL, params=params_temps_reel, timeout=10)
+                response_temps_reel.raise_for_status()
+                data_temps_reel = response_temps_reel.json()
+                
+                # Créer un dictionnaire des disponibilités par ID
+                disponibilites = {}
+                for record in data_temps_reel.get('records', []):
+                    fields = record.get('fields', {})
+                    borne_id = fields.get('id_pdc')
+                    if borne_id:
+                        disponibilites[borne_id] = {
+                            'statut': fields.get('statut', 'Inconnu'),
+                            'disponible': fields.get('etat_pdc') == 'Disponible',
+                            'nb_places_libres': fields.get('nb_places_libres', 0)
+                        }
+            except Exception as e:
+                print(f"⚠️ Erreur récupération temps réel Belib: {e}")
+                disponibilites = {}
+            
+            # 3. Traiter les données statiques
+            for record in data_statiques.get('records', []):
+                fields = record.get('fields', {})
+                geometry = record.get('geometry', {})
+                
+                # Extraire les informations
+                borne_id = fields.get('id_pdc') or f"BELIB_{fields.get('n_operateur', 'UNK')}"
+                nom = fields.get('nom_station', 'Borne Belib')
+                adresse = fields.get('adresse_station', 'Paris')
+                
+                # Coordonnées GPS
+                if geometry.get('coordinates'):
+                    longitude, latitude = geometry['coordinates']
+                else:
+                    continue
+                
+                # Filtrer par distance si destination fournie
+                if destination:
+                    distance = self._calculer_distance(
+                        latitude, longitude, destination[0], destination[1]
+                    )
+                    if distance > rayon_max_km:
+                        continue
+                
+                # Informations techniques
+                nb_points = fields.get('nbre_pdc', 1)
+                puissance = fields.get('puiss_max', '22 kW')
+                
+                # Types de connecteurs
+                connecteurs = []
+                if fields.get('prise_type_2') == 'true':
+                    connecteurs.append("Type 2")
+                if fields.get('prise_combo_ccs') == 'true':
+                    connecteurs.append("Combo CCS")
+                if fields.get('prise_chademo') == 'true':
+                    connecteurs.append("CHAdeMO")
+                if fields.get('prise_type_ef') == 'true':
+                    connecteurs.append("Type EF")
+                
+                if not connecteurs:
+                    connecteurs = ["Type 2"]  # Par défaut
+                
+                # Compatibilité véhicule
+                compatible = self._verifier_compatibilite_vehicule(type_vehicule, connecteurs, puissance)
+                
+                # Accès et tarif
+                acces = fields.get('acces_recharge', 'Public')
+                operateur = fields.get('nom_operateur', 'Belib')
+                tarif = fields.get('tarification', 'Voir opérateur')
+                
+                # Données temps réel
+                dispo_data = disponibilites.get(borne_id, {})
+                statut = dispo_data.get('statut', fields.get('statut', 'En service'))
+                disponible = dispo_data.get('disponible', True)
+                places_libres = dispo_data.get('nb_places_libres', nb_points)
+                
+                borne = BorneElectrique(
+                    id=borne_id,
+                    nom=nom,
+                    adresse=adresse,
+                    latitude=latitude,
+                    longitude=longitude,
+                    statut=statut,
+                    nb_points_charge=int(nb_points),
+                    types_connecteurs=connecteurs,
+                    puissance_max=str(puissance),
+                    disponible=disponible and statut == "En service",
+                    nb_places_libres=int(places_libres),
+                    acces=acces,
+                    operateur=operateur,
+                    tarif_info=tarif,
+                    compatible_vehicule=compatible,
+                    distance_point=0.0
+                )
+                
+                # Calculer la distance si destination fournie
+                if destination:
+                    borne.distance_point = self._calculer_distance(
+                        latitude, longitude, destination[0], destination[1]
+                    )
+                
+                bornes.append(borne)
+            
+            # Trier par distance et compatibilité
+            if destination:
+                bornes.sort(key=lambda b: (not b.compatible_vehicule, not b.disponible, b.distance_point))
+            
+            print(f"✅ {len(bornes)} bornes électriques Belib récupérées")
+            
+            # Stats pour debug
+            bornes_compatibles = len([b for b in bornes if b.compatible_vehicule])
+            bornes_disponibles = len([b for b in bornes if b.disponible])
+            print(f"   - {bornes_compatibles} compatibles avec {type_vehicule}")
+            print(f"   - {bornes_disponibles} disponibles actuellement")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Erreur réseau lors de la récupération Belib: {e}")
+            bornes = self._generer_bornes_fallback(destination)
+        except Exception as e:
+            print(f"❌ Erreur lors de la récupération des bornes Belib: {e}")
+            bornes = self._generer_bornes_fallback(destination)
+        
+        return bornes[:20]  # Limiter à 20 bornes max
+
     
     def __init__(self, supabase_client: Client = None):
         self.supabase = supabase_client
@@ -692,11 +965,6 @@ class CollecteurDonnees:
             {"nom": "Saint-Lazare", "slug": "saint+lazare", "latitude": 48.8755, "longitude": 2.3254, "lignes": ["3", "12", "13", "14", "RER E"]},
             {"nom": "Trocadéro", "slug": "trocadero", "latitude": 48.8635, "longitude": 2.2870, "lignes": ["6", "9"]},
             {"nom": "Invalides", "slug": "invalides", "latitude": 48.8566, "longitude": 2.3137, "lignes": ["8", "13", "RER C"]},
-            {"nom": "Concorde", "slug": "concorde", "latitude": 48.8651, "longitude": 2.3215, "lignes": ["1", "8", "12"]},
-            {"nom": "Saint-Michel", "slug": "saint+michel", "latitude": 48.8538, "longitude": 2.3444, "lignes": ["4", "RER B", "RER C"]},
-            {"nom": "Saint-Germain-des-Prés", "slug": "saint+germain+des+pres", "latitude": 48.8542, "longitude": 2.3334, "lignes": ["4"]},
-            
-            # Stations autour de la zone 19ème (près de Riquet)
             {"nom": "Jaurès", "slug": "jaures", "latitude": 48.8833, "longitude": 2.3717, "lignes": ["2", "5", "7bis"]},
             {"nom": "Stalingrad", "slug": "stalingrad", "latitude": 48.8842, "longitude": 2.3669, "lignes": ["2", "5", "7"]},
             {"nom": "Laumière", "slug": "laumiere", "latitude": 48.8889, "longitude": 2.3814, "lignes": ["5"]},
@@ -1046,6 +1314,103 @@ class PredicteurSaturation:
 
 
 class AssistantNavigation:
+    
+
+    def calculer_score_parking(self, taux_saturation, temps_acces, temps_marche, tarif, nb_travaux=0, impact_metro=0, distance_destination=0):
+        """Score simple : plus bas = meilleur. À personnaliser selon la logique métier."""
+        return (
+            taux_saturation * 100
+            + temps_acces
+            + temps_marche
+            + tarif * 2
+            + nb_travaux * 10
+            + impact_metro["impact"] * 5
+            + distance_destination
+        )
+
+    def _identifier_travaux_sur_trajet(self, route_points: List[Tuple[float, float]], travaux: List['Travaux']) -> List['Travaux']:
+        """Retourne la liste des travaux qui croisent le trajet (simplifié : à moins de 100m d'un point du trajet)"""
+        travaux_impactants = []
+        for t in travaux:
+            for pt in route_points:
+                dist = self.predicteur.collecteur._calculer_distance(pt[0], pt[1], t.latitude, t.longitude)
+                if dist < 0.1:  # 100m
+                    travaux_impactants.append(t)
+                    break
+        return travaux_impactants
+
+    def _calculer_score_borne(self, borne, dist_destination, dist_parking):
+        """Calcule un score d'attractivité pour une borne électrique"""
+        score = dist_destination * 10  # Base: distance à la destination
+        # Pénalités
+        if not borne.disponible:
+            score += 50
+        if not borne.compatible_vehicule:
+            score += 100
+        if borne.statut != "En service":
+            score += 30
+        if borne.nb_places_libres == 0:
+            score += 20
+        # Bonus
+        if "50 kW" in borne.puissance_max or "DC" in borne.puissance_max:
+            score -= 10
+        if dist_parking < 0.3:
+            score -= 5
+        return score    
+
+    def recommander_avec_bornes_electriques(self, position_actuelle: Tuple[float, float],
+                                            destination_finale: Tuple[float, float],
+                                            heure_arrivee_souhaitee: datetime,
+                                            type_vehicule: str = "voiture",
+                                            inclure_bornes: bool = True) -> Dict:
+            """Recommandation intégrant parkings et bornes électriques"""
+            # Récupération classique des parkings
+            resultat_parking = self.recommander_parking(
+                position_actuelle, destination_finale, heure_arrivee_souhaitee
+            )
+            # Ajouter les bornes électriques si demandé
+            if inclure_bornes:
+                print("🔋 Recherche de bornes électriques...")
+                bornes = self.collecteur.recuperer_bornes_belib(
+                    destination_finale, rayon_max_km=2.0, type_vehicule=type_vehicule
+                )
+                # Analyser les bornes par rapport aux parkings et à la destination
+                bornes_analysees = []
+                for borne in bornes:
+                    dist_parking = float('inf')
+                    if resultat_parking.get('parking_recommande'):
+                        parking = resultat_parking['parking_recommande']
+                        dist_parking = self.predicteur._calculer_distance(
+                            borne.latitude, borne.longitude,
+                            parking['latitude'], parking['longitude']
+                        )
+                    dist_destination = self.predicteur._calculer_distance(
+                        borne.latitude, borne.longitude,
+                        destination_finale[0], destination_finale[1]
+                    )
+                    temps_marche_borne = self.calculer_temps_trajet(
+                        (borne.latitude, borne.longitude),
+                        destination_finale,
+                        mode='walking'
+                    )
+                    borne_analysee = {
+                        'borne': borne,
+                        'distance_parking': dist_parking,
+                        'distance_destination': dist_destination,
+                        'temps_marche_destination': temps_marche_borne['duration'] if temps_marche_borne else 15,
+                        'score_attractivite': self._calculer_score_borne(borne, dist_destination, dist_parking)
+                    }
+                    bornes_analysees.append(borne_analysee)
+                bornes_analysees.sort(key=lambda x: x['score_attractivite'])
+                resultat_parking['bornes_electriques'] = {
+                    'total_trouvees': len(bornes),
+                    'compatibles': len([b for b in bornes if b.compatible_vehicule]),
+                    'disponibles': len([b for b in bornes if b.disponible]),
+                    'recommandees': bornes_analysees[:5],  # Top 5
+                    'type_vehicule': type_vehicule
+                }
+            return resultat_parking
+
 
     def __init__(self, predicteur: PredicteurSaturation, collecteur_donnees: CollecteurDonnees):
         self.predicteur = predicteur
@@ -1162,7 +1527,11 @@ class AssistantNavigation:
                 return None
         except requests.exceptions.RequestException as e:
             print(f"Erreur de connexion à l'API Directions: {e}")
+
+
+
             return None
+
         except Exception as e:
             print(f"Erreur lors du calcul du trajet: {e}")
             return None
@@ -1188,8 +1557,9 @@ class AssistantNavigation:
             if distance_min < 1.0:  # Moins de 1km
                 if travail.niveau_perturbation == "Très perturbant":
                     impact_total += 0.3  # +30% de temps
+               
                 else:
-                    impact_total += 0.15  # +15% de temps
+                    impact_total += 0.15   # +15% de temps
         
         return min(impact_total, 0.8)  # Plafonner à +80% max
 
@@ -1419,200 +1789,12 @@ class AssistantNavigation:
                 for alt in alternatives
             ]
         }
-
-    def _identifier_travaux_sur_trajet(self, route_points: List[Tuple[float, float]], 
-                                      travaux: List[Travaux]) -> List[Travaux]:
-        """Identifie les travaux qui impactent un trajet donné"""
-        travaux_impactants = []
-        
-        for travail in travaux:
-            if not travail.impact_circulation:
-                continue
-                
-            for point in route_points[::5]:  # Échantillonner tous les 5 points
-                distance = self.predicteur._calculer_distance(
-                    point[0], point[1], travail.latitude, travail.longitude
-                )
-                if distance < 0.3:  # Moins de 300m du trajet
-                    travaux_impactants.append(travail)
-                    break
-        
-        return travaux_impactants
-
-    def _calculer_impact_metro(self, stations_parking: List[StationMetro], 
-                              stations_destination: List[StationMetro]) -> Dict:
-        """Calcule l'impact des fermetures de métro sur l'attractivité du parking"""
-        impact = {
-            'score_penalite': 0,
-            'stations_fermees_parking': [],
-            'stations_fermees_destination': [],
-            'recommandation': ""
+    
+    def _calculer_impact_metro(self, stations_parking, stations_destination):
+        """Retourne un impact métro neutre (aucune perturbation) si non implémenté."""
+        return {
+            "recommandation": None,
+            "impact": 0,
+            "stations_fermees_destination": [],
+            "stations_fermees_parking": []
         }
-        
-        # Analyser les fermetures près du parking
-        for station in stations_parking:
-            if station.fermee:
-                impact['stations_fermees_parking'].append({
-                    'nom': station.nom,
-                    'lignes': station.lignes,
-                    'raison': station.raison_fermeture
-                })
-                impact['score_penalite'] += 5
-        
-        # Analyser les fermetures près de la destination
-        for station in stations_destination:
-            if station.fermee:
-                impact['stations_fermees_destination'].append({
-                    'nom': station.nom,
-                    'lignes': station.lignes,
-                    'raison': station.raison_fermeture
-                })
-                impact['score_penalite'] -= 10  # Bonus car plus de demande de parking
-        
-        # Générer une recommandation
-        if impact['stations_fermees_destination']:
-            impact['recommandation'] = f"Parking avantageux : {len(impact['stations_fermees_destination'])} station(s) fermée(s) près de la destination"
-        elif impact['stations_fermees_parking']:
-            impact['recommandation'] = f"Attention : {len(impact['stations_fermees_parking'])} station(s) fermée(s) près du parking"
-        else:
-            impact['recommandation'] = "Métro normal, pas d'impact particulier"
-        
-        return impact
-    
-    def calculer_score_parking(self, taux_saturation: float, temps_acces: int, 
-                              temps_marche: int, tarif: float, nb_travaux: int = 0,
-                              impact_metro: Dict = None, distance_destination: float = 0.0) -> float:
-        """Calcule un score composite amélioré pour classer les parkings"""
-        penalite_saturation = taux_saturation ** 2 * 100
-        penalite_temps = (temps_acces + temps_marche) * 0.5
-        penalite_tarif = tarif * 2
-        penalite_travaux = nb_travaux * 15
-        penalite_distance = distance_destination * 10
-        
-        # Impact métro
-        impact_metro_score = 0
-        if impact_metro:
-            impact_metro_score = impact_metro.get('score_penalite', 0)
-        
-        bonus_disponibilite = 0 if taux_saturation > 0.8 else (1 - taux_saturation) * 20
-        
-        return (penalite_saturation + penalite_temps + penalite_tarif + 
-                penalite_travaux + penalite_distance + impact_metro_score - bonus_disponibilite)
-    
-
-class SystemeParkingParis:
-    """Système principal d'assistance au parking pour Paris"""
-    
-    def __init__(self):
-        self.supabase = None
-        if SUPABASE_URL and SUPABASE_KEY:
-            try:
-                self.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-                print("✅ Connexion Supabase établie")
-            except Exception as e:
-                print(f"⚠️ Connexion Supabase échouée: {e}")
-        
-        # Initialisation correcte des dépendances
-        self.collecteur = CollecteurDonnees(self.supabase)
-        self.predicteur = PredicteurSaturation(self.collecteur)
-        self.assistant_nav = AssistantNavigation(self.predicteur, self.collecteur)
-        
-    def assister_conducteur(self, position_actuelle: Tuple[float, float], destination: Tuple[float, float]) -> Dict:
-        heure_arrivee_souhaitee = datetime.now() 
-        
-        resultat_reco = self.assistant_nav.recommander_parking(
-            position_actuelle, destination, heure_arrivee_souhaitee
-        )
-        return resultat_reco
-
-    def afficher_recommandation(self, resultat: Dict):
-        """Affiche les recommandations de manière lisible"""
-        if not resultat or not resultat.get('parking_recommande'):
-            print("\n❌ Aucune recommandation de parking disponible.")
-            return
-
-        print("\n🎯 RECOMMANDATION PRINCIPALE:")
-        print(f"Parking: {resultat['parking_recommande']['nom']}")
-        print(f"Adresse: {resultat['parking_recommande']['adresse']}")
-        print(f"Places disponibles: {resultat['parking_recommande']['places_disponibles']}/{resultat['parking_recommande']['capacite_totale']}")
-        print(f"Tarif: {resultat['parking_recommande']['tarif_horaire']}€/h")
-        
-        print("\n⏱️  TEMPS ESTIMÉ:")
-        print(f"Trajet jusqu'au parking: {resultat['temps_estime']['acces_parking']} min")
-        print(f"Marche jusqu'à destination: {resultat['temps_estime']['marche_destination']} min")
-        print(f"Temps total: {resultat['temps_estime']['total']} min")
-        
-        print("\n📊 SATURATION:")
-        print(f"Taux actuel: {resultat['saturation']['actuelle']}")
-        print(f"Taux prédit à l'arrivée: {resultat['saturation']['predite']}")
-        print(f"Fiabilité de la prédiction: {resultat['saturation']['fiabilite']}")
-        
-        if resultat['saturation']['temps_avant_saturation'] and resultat['saturation']['temps_avant_saturation'] != "N/A":
-            print(f"⚠️  Temps avant saturation: {resultat['saturation']['temps_avant_saturation']}")
-        
-        # Afficher les travaux impactants
-        if resultat.get('travaux_sur_trajet'):
-            print("\n🚧 TRAVAUX SUR VOTRE TRAJET:")
-            for travail in resultat['travaux_sur_trajet']:
-                print(f"- {travail.nom} ({travail.niveau_perturbation})")
-                print(f"  {travail.description}")
-
-        # Afficher les informations métro
-        if resultat.get('impact_metro'):
-            print(f"\n🚇 IMPACT MÉTRO:")
-            print(f"Recommandation: {resultat['impact_metro']['recommandation']}")
-            
-            if resultat['impact_metro']['stations_fermees_destination']:
-                print("Stations fermées près de la destination:")
-                for station in resultat['impact_metro']['stations_fermees_destination']:
-                    print(f"  - {station['nom']} (Lignes: {', '.join(station['lignes'])})")
-                    print(f"    Raison: {station['raison']}")
-            
-            if resultat['impact_metro']['stations_fermees_parking']:
-                print("Stations fermées près du parking:")
-                for station in resultat['impact_metro']['stations_fermees_parking']:
-                    print(f"  - {station['nom']} (Lignes: {', '.join(station['lignes'])})")
-                    print(f"    Raison: {station['raison']}")
-        
-        if resultat['alternatives']:
-            print("\n🔄 ALTERNATIVES:")
-            for i, alt in enumerate(resultat['alternatives'], 1):
-                travaux_info = f" - {alt['nb_travaux_impactants']} travaux" if alt['nb_travaux_impactants'] > 0 else ""
-                metro_info = f" - {alt['impact_metro']['recommandation']}" if alt.get('impact_metro') else ""
-                print(f"{i}. {alt['nom']} - {alt['temps_total']} min (saturation: {alt['saturation_predite']:.2f}){travaux_info}{metro_info}")
-
-
-# Exemple d'utilisation
-if __name__ == "__main__":
-    print("🚗 Système d'Assistance au Parking - Paris")
-    print("=" * 60)
-    
-    # Créer le système
-    systeme = SystemeParkingParis()
-    
-    # Test avec adresse Riquet
-    position_actuelle = (48.8584, 2.3475)  # Châtelet
-    destination = (48.8889, 2.3625)  # Proche de Riquet
-    
-    print(f"\n🧪 TEST AVEC DESTINATION PROCHE DE RIQUET")
-    print(f"Position: {position_actuelle}")
-    print(f"Destination: {destination}")
-    
-    # Obtenir les recommandations
-    resultat = systeme.assister_conducteur(position_actuelle, destination)
-    
-    # Afficher les résultats
-    systeme.afficher_recommandation(resultat)
-    
-    # Sauvegarder dans Supabase (si configuré)
-    if systeme.supabase and resultat and resultat.get('parking_recommande'):
-        try:
-            taux_actuel_float = float(resultat['saturation']['actuelle']) 
-            systeme.collecteur.sauvegarder_historique(
-                resultat['parking_recommande']['id'],
-                taux_actuel_float
-            )
-        except ValueError:
-            print("Erreur: Impossible de convertir le taux de saturation actuel en nombre pour la sauvegarde.")
-        except Exception as e:
-            print(f"Erreur lors de la sauvegarde de l'historique: {e}")
